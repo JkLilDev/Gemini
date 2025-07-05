@@ -1,102 +1,112 @@
 import os
 import discord
 from discord.ext import commands
+from dotenv import load_dotenv
 import google.generativeai as genai
-# from dotenv import load_dotenv # REMOVE or COMMENT OUT this line for Azure deployment
+from flask import Flask
+import threading
+import asyncio
 
-# --- Configuration ---
-# Azure App Service will provide these as environment variables
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not DISCORD_BOT_TOKEN:
-    # This will now check if the environment variable is set by Azure
-    # If running locally, you'll still need your .env file
-    raise ValueError("DISCORD_BOT_TOKEN not found in environment variables.")
-if not GEMINI_API_KEY:
-    # This will now check if the environment variable is set by Azure
-    raise ValueError("GEMINI_API_KEY not found in environment variables.")
-
-# Configure the Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-
-# Initialize the Gemini model
 model = genai.GenerativeModel('gemini-pro')
 
-# --- Discord Bot Setup ---
+# Initialize Discord bot
 intents = discord.Intents.default()
 intents.message_content = True
+bot = commands.Bot(command_prefix='/', intents=intents)
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Store conversation history per channel
+chat_history = {}
 
-# Dictionary to store conversation history for each user/channel
-conversation_history = {}
+# Flask app for Azure health check
+app = Flask(__name__)
 
-# --- Helper function for interacting with Gemini API ---
-async def generate_gemini_response(user_id, message_content):
-    global conversation_history
+@app.route('/')
+def health_check():
+    return "Bot is running", 200
 
-    if user_id not in conversation_history:
-        conversation_history[user_id] = model.start_chat(history=[])
-
-    chat = conversation_history[user_id]
-
+# Gemini API interaction
+async def get_gemini_response(message_content, channel_id):
     try:
-        response = await chat.send_message_async(message_content)
-        return response.text
-    except Exception as e:
-        print(f"Error calling Gemini API: {e}")
-        return "An error occurred while communicating with Gemini. Please try again later."
+        # Initialize history for the channel if not exists
+        if channel_id not in chat_history:
+            chat_history[channel_id] = [
+                {"role": "user", "parts": ["Hi!"]},
+                {"role": "model", "parts": ["Hello! I am your Discord AI bot powered by Gemini."]}
+            ]
 
-# --- Discord Bot Events ---
+        # Add user message to history
+        chat_history[channel_id].append({"role": "user", "parts": [message_content]})
+
+        # Generate response
+        response = model.generate_content(
+            message_content,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=500
+            )
+        )
+
+        # Extract response text
+        response_text = response.text
+
+        # Add bot response to history
+        chat_history[channel_id].append({"role": "model", "parts": [response_text]})
+        
+        # Limit history to last 10 messages to manage context
+        if len(chat_history[channel_id]) > 10:
+            chat_history[channel_id] = chat_history[channel_id][-10:]
+
+        return response_text
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Bot event: On ready
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    print('------')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s).")
-    except Exception as e:
-        print(f"Error syncing commands: {e}")
+    print(f'Bot logged in as {bot.user}')
 
+# Bot command: Summarize text
 @bot.command()
-async def ping(ctx):
-    """Responds with 'Pong!' to test bot responsiveness."""
-    await ctx.send("Pong!")
+async def summarize(ctx, *, text):
+    response = await get_gemini_response(f"Summarize: {text}", ctx.channel.id)
+    await ctx.send(response)
 
-@bot.tree.command(name="test", description="Tests if the bot is responding with a 'Hello!'")
-async def test_command(interaction: discord.Interaction):
-    """Responds with 'Hello from your bot!' as a slash command."""
-    await interaction.response.send_message("Hello from your bot!", ephemeral=True)
+# Bot command: Clear conversation history
+@bot.command()
+async def forget(ctx):
+    if ctx.channel.id in chat_history:
+        del chat_history[ctx.channel.id]
+    await ctx.send("Conversation history cleared!")
 
-
+# Bot event: Process messages
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Respond only if bot is mentioned or in DM
     if bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel):
-        async with message.channel.typing():
-            text_content = message.content.replace(f'<@{bot.user.id}>', '').strip()
-            if not text_content:
-                await message.channel.send("Hey there! How can I help you today?")
-                return
-            user_context_id = message.author.id
-            response_text = await generate_gemini_response(user_context_id, text_content)
-            await message.channel.send(response_text)
+        response = await get_gemini_response(message.content, message.channel.id)
+        await message.channel.send(response)
 
     await bot.process_commands(message)
 
-@bot.tree.command(name="forget", description="Clears the bot's memory for your current conversation.")
-async def forget(interaction: discord.Interaction):
-    user_context_id = interaction.user.id
-    if user_context_id in conversation_history:
-        del conversation_history[user_context_id]
-        await interaction.response.send_message("My memory of our conversation has been cleared!", ephemeral=True)
-    else:
-        await interaction.response.send_message("I don't have any memory of our conversation to clear.", ephemeral=True)
+# Run Flask app in a separate thread
+def run_flask():
+    app.run(host='0.0.0.0', port=8000)
 
-# --- Run the Bot ---
-if __name__ == '__main__':
-    bot.run(DISCORD_BOT_TOKEN)
+# Run both Flask and Discord bot
+def main():
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    
+    bot.run(os.getenv("DISCORD_TOKEN"))
 
+if __name__ == "__main__":
+    main()
